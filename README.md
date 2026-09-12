@@ -1,4 +1,4 @@
-A small DIY text messenger built around an ESP32 and LoRa.
+A small DIY text messenger built around an ESP32-devkit-v1 and LoRa-module.
 
 The idea is pretty simple: build two standalone devices that can send text messages to each other without Wi-Fi, Bluetooth, or a phone. Each unit has a keypad for typing, an OLED display for the interface, and an RFM95W LoRa module for the radio link.
 
