@@ -1,0 +1,93 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <Preferences.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_TCA8418.h>
+
+#define LORA_NSS_PIN 4
+#define LORA_SCK_PIN 18
+#define LORA_MISO_PIN 19
+#define LORA_MOSI_PIN 23
+#define LORA_DIO0_PIN 26
+#define LORA_RESET_PIN 27
+#define OLED_SDA_PIN 21
+#define OLED_SCL_PIN 22
+
+// Pins are provided by Schematik from the physical wiring table.
+
+// Forward declarations
+void IRAM_ATTR onRadioEvent();
+void radioWrite(uint8_t reg,uint8_t value);
+uint8_t radioRead(uint8_t reg);
+void radioBurstWrite(uint8_t reg,const uint8_t*data,size_t n);
+void radioBurstRead(uint8_t reg,uint8_t*data,size_t n);
+void radioMode(uint8_t mode);
+void clearIrq();
+void beginReceive();
+bool radioBegin();
+bool radioTransmit(const String&packet);
+bool radioReadPacket(String&packet);
+String tailOf(const String&t,size_t n);
+String recipientId();
+void drawScreen(const String&a,const String&b);
+void showDraft();
+void sendAck(const String&to,const String&id);
+void handleRadioPacket();
+void sendDraft();
+void addMultiTap(char d);
+void handleKeyRelease(char k,uint32_t held);
+bool readKeypad(char&key,uint32_t&held);
+void chooseUnitRole();
+
+constexpr uint8_t KEYPAD_ADDRESS=0x34, SCREEN_WIDTH=128, SCREEN_HEIGHT=64;
+// India 865–868 MHz SRD band. Use an RFM95W-868S2 and a matched antenna.
+constexpr float LORA_FREQUENCY_MHZ=865.0625;
+constexpr int8_t LORA_POWER_DBM=14;
+constexpr uint8_t LORA_SYNC_WORD=0x12;
+constexpr size_t MAX_MESSAGE_LENGTH=60;
+constexpr uint32_t MULTITAP_PAUSE_MS=700, SEND_HOLD_MS=900, ACK_TIMEOUT_MS=2200;
+constexpr uint8_t SEND_ATTEMPTS=2;
+constexpr uint16_t ACK_TURNAROUND_MS=100;
+constexpr uint8_t REG_FIFO=0x00, REG_OP_MODE=0x01, REG_FRF_MSB=0x06, REG_PA_CONFIG=0x09, REG_FIFO_ADDR_PTR=0x0D, REG_FIFO_TX_BASE_ADDR=0x0E, REG_FIFO_RX_BASE_ADDR=0x0F, REG_FIFO_RX_CURRENT_ADDR=0x10, REG_IRQ_FLAGS=0x12, REG_RX_NB_BYTES=0x13, REG_MODEM_CONFIG_1=0x1D, REG_MODEM_CONFIG_2=0x1E, REG_PAYLOAD_LENGTH=0x22, REG_MODEM_CONFIG_3=0x26, REG_SYNC_WORD=0x39, REG_DIO_MAPPING_1=0x40, REG_VERSION=0x42;
+constexpr uint8_t MODE_LONG_RANGE=0x80, MODE_SLEEP=0x00, MODE_STDBY=0x01, MODE_TX=0x03, MODE_RX_CONTINUOUS=0x05;
+constexpr uint8_t IRQ_TX_DONE=0x08, IRQ_RX_DONE=0x40, IRQ_PAYLOAD_CRC_ERROR=0x20;
+
+Adafruit_SSD1306 display(SCREEN_WIDTH,SCREEN_HEIGHT,&Wire,-1);
+Adafruit_TCA8418 keypad;
+Preferences preferences;
+volatile bool radioEvent=false;
+String draft, screenLine1, screenLine2, waitingForAck;
+char unitId='\0', lastDigit='\0';
+uint8_t tapIndex=0;
+uint32_t lastTapAt=0, keyPressedAt[4][3]={};
+uint16_t messageNumber=0;
+bool delivered=false;
+const char keyMap[4][3]={{'1','2','3'},{'4','5','6'},{'7','8','9'},{'*','0','#'}};
+
+void IRAM_ATTR onRadioEvent(){radioEvent=true;}
+void radioWrite(uint8_t reg,uint8_t value){SPI.beginTransaction(SPISettings(8000000,MSBFIRST,SPI_MODE0));digitalWrite(LORA_NSS_PIN,LOW);SPI.transfer(reg|0x80);SPI.transfer(value);digitalWrite(LORA_NSS_PIN,HIGH);SPI.endTransaction();}
+uint8_t radioRead(uint8_t reg){SPI.beginTransaction(SPISettings(8000000,MSBFIRST,SPI_MODE0));digitalWrite(LORA_NSS_PIN,LOW);SPI.transfer(reg&0x7F);uint8_t v=SPI.transfer(0);digitalWrite(LORA_NSS_PIN,HIGH);SPI.endTransaction();return v;}
+void radioBurstWrite(uint8_t reg,const uint8_t*data,size_t n){SPI.beginTransaction(SPISettings(8000000,MSBFIRST,SPI_MODE0));digitalWrite(LORA_NSS_PIN,LOW);SPI.transfer(reg|0x80);while(n--)SPI.transfer(*data++);digitalWrite(LORA_NSS_PIN,HIGH);SPI.endTransaction();}
+void radioBurstRead(uint8_t reg,uint8_t*data,size_t n){SPI.beginTransaction(SPISettings(8000000,MSBFIRST,SPI_MODE0));digitalWrite(LORA_NSS_PIN,LOW);SPI.transfer(reg&0x7F);while(n--)*data++=SPI.transfer(0);digitalWrite(LORA_NSS_PIN,HIGH);SPI.endTransaction();}
+void radioMode(uint8_t mode){radioWrite(REG_OP_MODE,MODE_LONG_RANGE|mode);}
+void clearIrq(){radioWrite(REG_IRQ_FLAGS,0xFF);}
+void beginReceive(){radioEvent=false;radioMode(MODE_STDBY);clearIrq();radioWrite(REG_FIFO_ADDR_PTR,0);radioMode(MODE_RX_CONTINUOUS);}
+bool radioBegin(){pinMode(LORA_NSS_PIN,OUTPUT);digitalWrite(LORA_NSS_PIN,HIGH);pinMode(LORA_RESET_PIN,OUTPUT);digitalWrite(LORA_RESET_PIN,LOW);delay(2);digitalWrite(LORA_RESET_PIN,HIGH);delay(10);if(radioRead(REG_VERSION)!=0x12)return false;radioMode(MODE_SLEEP);uint32_t frf=(uint32_t)((LORA_FREQUENCY_MHZ*1000000.0f)/61.03515625f);radioWrite(REG_FRF_MSB,(frf>>16)&0xFF);radioWrite(REG_FRF_MSB+1,(frf>>8)&0xFF);radioWrite(REG_FRF_MSB+2,frf&0xFF);radioWrite(REG_PA_CONFIG,0x80|(uint8_t)(LORA_POWER_DBM-2));radioWrite(REG_FIFO_TX_BASE_ADDR,0);radioWrite(REG_FIFO_RX_BASE_ADDR,0);radioWrite(REG_MODEM_CONFIG_1,0x72);radioWrite(REG_MODEM_CONFIG_2,0x74);radioWrite(REG_MODEM_CONFIG_3,0x04);radioWrite(REG_SYNC_WORD,LORA_SYNC_WORD);radioWrite(REG_DIO_MAPPING_1,0x00);radioMode(MODE_STDBY);pinMode(LORA_DIO0_PIN,INPUT);attachInterrupt(digitalPinToInterrupt(LORA_DIO0_PIN),onRadioEvent,RISING);beginReceive();return true;}
+bool radioTransmit(const String&packet){if(packet.length()>255)return false;radioMode(MODE_STDBY);clearIrq();radioWrite(REG_FIFO_ADDR_PTR,0);radioBurstWrite(REG_FIFO,(const uint8_t*)packet.c_str(),packet.length());radioWrite(REG_PAYLOAD_LENGTH,packet.length());radioEvent=false;radioMode(MODE_TX);uint32_t t=millis();while(millis()-t<3000){if(radioEvent||(radioRead(REG_IRQ_FLAGS)&IRQ_TX_DONE)){uint8_t flags=radioRead(REG_IRQ_FLAGS);clearIrq();radioEvent=false;return(flags&IRQ_TX_DONE)!=0;}delay(1);}radioMode(MODE_STDBY);return false;}
+bool radioReadPacket(String&packet){uint8_t flags=radioRead(REG_IRQ_FLAGS);if(!(flags&IRQ_RX_DONE))return false;clearIrq();radioEvent=false;if(flags&IRQ_PAYLOAD_CRC_ERROR)return false;uint8_t n=radioRead(REG_RX_NB_BYTES);radioWrite(REG_FIFO_ADDR_PTR,radioRead(REG_FIFO_RX_CURRENT_ADDR));char buffer[256];radioBurstRead(REG_FIFO,(uint8_t*)buffer,n);buffer[n]='\0';packet=String(buffer);return true;}
+String tailOf(const String&t,size_t n){return t.length()<=n?t:t.substring(t.length()-n);}
+String recipientId(){return unitId=='A'?"B":"A";}
+void drawScreen(const String&a,const String&b){if(a==screenLine1&&b==screenLine2)return;screenLine1=a;screenLine2=b;display.clearDisplay();display.setTextColor(SSD1306_WHITE);display.setTextSize(1);display.setCursor(0,0);display.print("LoRa Messenger ");if(unitId)display.print(unitId);display.drawFastHLine(0,10,SCREEN_WIDTH,SSD1306_WHITE);display.setCursor(0,16);display.print(a);display.setCursor(0,31);display.print(b);display.setCursor(0,52);display.print("# space; hold # send");display.display();}
+const char*lettersFor(char k){switch(k){case'1':return"1.,?!";case'2':return"ABC2";case'3':return"DEF3";case'4':return"GHI4";case'5':return"JKL5";case'6':return"MNO6";case'7':return"PQRS7";case'8':return"TUV8";case'9':return"WXYZ9";case'0':return"0";default:return"";}}
+void showDraft(){drawScreen(draft.length()<=20?draft:draft.substring(0,20),draft.length()<=20?"":tailOf(draft,20));}
+void sendAck(const String&to,const String&id){delay(ACK_TURNAROUND_MS);radioTransmit("A|"+String(unitId)+"|"+to+"|"+id);beginReceive();}
+void handleRadioPacket(){String p;if(!radioReadPacket(p)){beginReceive();return;}int p1=p.indexOf('|'),p2=p1<0?-1:p.indexOf('|',p1+1),p3=p2<0?-1:p.indexOf('|',p2+1),p4=p3<0?-1:p.indexOf('|',p3+1);if(p1<0||p2<0||p3<0){beginReceive();return;}String kind=p.substring(0,p1),from=p.substring(p1+1,p2),to=p.substring(p2+1,p3);if(to!=String(unitId)||from==String(unitId)){beginReceive();return;}if(kind=="A"&&p.substring(p3+1)==waitingForAck)delivered=true;else if(kind=="M"&&p4>=0){String id=p.substring(p3+1,p4),text=p.substring(p4+1);drawScreen("FROM "+from+":",tailOf(text,20));sendAck(from,id);return;}beginReceive();}
+void sendDraft(){if(!draft.length()){drawScreen("TYPE A MESSAGE","then hold # to send");return;}String text=draft,id=String(++messageNumber),packet="M|"+String(unitId)+"|"+recipientId()+"|"+id+"|"+text;waitingForAck=id;delivered=false;for(uint8_t a=0;a<SEND_ATTEMPTS&&!delivered;++a){drawScreen(a?"RETRYING":"SENDING TO "+recipientId(),tailOf(text,20));if(!radioTransmit(packet)){drawScreen("SEND ERROR","check radio wiring");beginReceive();return;}beginReceive();uint32_t t=millis();while(millis()-t<ACK_TIMEOUT_MS&&!delivered){if(radioEvent)handleRadioPacket();delay(2);}}if(delivered){drawScreen("DELIVERED to "+recipientId(),tailOf(text,20));draft="";}else drawScreen("NOT CONFIRMED","check other unit/range");waitingForAck="";lastDigit='\0';beginReceive();}
+void addMultiTap(char d){const char*c=lettersFor(d);size_t n=strlen(c);if(!n||draft.length()>=MAX_MESSAGE_LENGTH)return;if(d==lastDigit&&millis()-lastTapAt<MULTITAP_PAUSE_MS&&draft.length()){tapIndex=(tapIndex+1)%n;draft=draft.substring(0,draft.length()-1)+c[tapIndex];}else{tapIndex=0;draft+=c[0];}lastDigit=d;lastTapAt=millis();showDraft();}
+void handleKeyRelease(char k,uint32_t held){if(k>='0'&&k<='9'){addMultiTap(k);return;}lastDigit='\0';if(k=='#'){if(held>=SEND_HOLD_MS)sendDraft();else if(draft.length()<MAX_MESSAGE_LENGTH){draft+=' ';showDraft();}}else if(k=='*'){if(draft.length())draft=draft.substring(0,draft.length()-1);showDraft();}}
+bool readKeypad(char&key,uint32_t&held){while(keypad.available()){uint8_t event=keypad.getEvent();bool released=(event&0x80)!=0;uint8_t number=event&0x7F;if(!number)continue;--number;uint8_t row=number/10,col=number%10;if(row>=4||col>=3)continue;if(!released)keyPressedAt[row][col]=millis();else{key=keyMap[row][col];held=millis()-keyPressedAt[row][col];return true;}}return false;}
+void chooseUnitRole(){preferences.begin("lora-msg",false);unitId=preferences.getChar("unit",'\0');if(unitId=='A'||unitId=='B')return;drawScreen("FIRST SETUP","press 1: A, 2: B");while(!unitId){char k;uint32_t h;if(readKeypad(k,h)){if(k=='1')unitId='A';if(k=='2')unitId='B';if(unitId)preferences.putChar("unit",unitId);}delay(2);}drawScreen("UNIT "+String(unitId)+" SAVED","other unit is "+recipientId());delay(900);}
+void setup(){Wire.begin(OLED_SDA_PIN,OLED_SCL_PIN);display.begin(SSD1306_SWITCHCAPVCC,0x3C);drawScreen("STARTING","attach antenna first");if(!keypad.begin(KEYPAD_ADDRESS,&Wire)){drawScreen("KEYPAD ERROR","check shared wires");while(true)delay(100);}keypad.matrix(4,3);chooseUnitRole();SPI.begin(LORA_SCK_PIN,LORA_MISO_PIN,LORA_MOSI_PIN,LORA_NSS_PIN);if(!radioBegin()){drawScreen("RADIO ERROR","check RFM95W wiring");return;}drawScreen("READY FOR "+recipientId(),"type; hold # send");}
+void loop(){char k;uint32_t h;if(readKeypad(k,h))handleKeyRelease(k,h);if(radioEvent)handleRadioPacket();}
